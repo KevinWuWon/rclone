@@ -685,6 +685,24 @@ resource key is not needed.
 			Advanced:  true,
 			Sensitive: true,
 		}, {
+			Name: "list_r_flat",
+			Help: `List all accessible metadata before reconstructing the requested tree locally.
+
+This changes ListR (used by --fast-list and ncdu --batch) to use a
+paginated inventory without parent queries. It scans the entire visible
+Drive corpus even for a small subtree and holds the metadata in memory.
+The page chain is sequential; this is not always faster than normal listing.
+
+Shortcuts are resolved from the inventory. Missing targets, directory cycles,
+and duplicate directory paths cause an error rather than an incomplete tree.
+Use --drive-skip-shortcuts to explicitly omit shortcuts if needed.
+Shared-with-me, starred-only, trashed-only and appDataFolder views are unsupported.
+Initial root/subtree resolution can still perform directory lookups.
+Depth limits and files-from options can select ordinary listing instead.
+Normal listing and other backends are unchanged.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name: "fast_list_bug_fix",
 			Help: `Work around a bug in Google Drive listing.
 
@@ -842,6 +860,7 @@ type Options struct {
 	SkipShortcuts             bool                 `config:"skip_shortcuts"`
 	SkipDanglingShortcuts     bool                 `config:"skip_dangling_shortcuts"`
 	ResourceKey               string               `config:"resource_key"`
+	ListRFlat                 bool                 `config:"list_r_flat"`
 	FastListBugFix            bool                 `config:"fast_list_bug_fix"`
 	MetadataOwner             rwChoice             `config:"metadata_owner"`
 	MetadataPermissions       rwChoice             `config:"metadata_permissions"`
@@ -1019,6 +1038,11 @@ func (f *Fs) getRootID(ctx context.Context) (string, error) {
 //
 // Search params: https://developers.google.com/drive/search-parameters
 func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directoriesOnly, filesOnly, trashedOnly, includeAll bool, fn listFn) (found bool, err error) {
+	return f.listWithMode(ctx, dirIDs, title, directoriesOnly, filesOnly, trashedOnly, includeAll, false, fn)
+}
+
+// listWithMode optionally retains raw shortcuts and requires a complete inventory.
+func (f *Fs) listWithMode(ctx context.Context, dirIDs []string, title string, directoriesOnly, filesOnly, trashedOnly, includeAll, inventory bool, fn listFn) (found bool, err error) {
 	var query []string
 	if !includeAll {
 		q := "trashed=" + strconv.FormatBool(trashedOnly)
@@ -1094,7 +1118,7 @@ func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directorie
 	}
 
 	// Constrain query using filter if this remote is a sync/copy/walk source.
-	if fi, use := filter.GetConfig(ctx), filter.GetUseFilter(ctx); fi != nil && use {
+	if fi, use := filter.GetConfig(ctx), filter.GetUseFilter(ctx); fi != nil && use && !inventory {
 		queryByTime := func(op string, tm time.Time) {
 			if tm.IsZero() {
 				return
@@ -1148,11 +1172,14 @@ OUTER:
 			return false, fmt.Errorf("couldn't list directory: %w", err)
 		}
 		if files.IncompleteSearch {
+			if inventory {
+				return false, errors.New("flat listing: search result incomplete")
+			}
 			fs.Errorf(f, "search result INCOMPLETE")
 		}
 		for _, item := range files.Files {
 			item.Name = f.opt.Enc.ToStandardName(item.Name)
-			if isShortcut(item) {
+			if isShortcut(item) && !inventory {
 				// ignore shortcuts if directed
 				if f.opt.SkipShortcuts {
 					continue
@@ -2225,6 +2252,130 @@ func (f *Fs) listRRunner(ctx context.Context, wg *sync.WaitGroup, in chan listRE
 	out <- nil
 }
 
+// listRFlat inventories metadata before resolving paths and shortcuts locally.
+func (f *Fs) listRFlat(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	if f.opt.SharedWithMe || f.opt.StarredOnly || f.opt.TrashedOnly || f.rootFolderID == "appDataFolder" {
+		return errors.New("--drive-list-r-flat does not support shared-with-me, starred-only, trashed-only or appDataFolder views")
+	}
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+	directoryID = actualID(directoryID)
+	if directoryID == "root" {
+		directoryID, err = f.getRootID(ctx)
+		if err != nil {
+			return fmt.Errorf("flat listing: resolve root ID: %w", err)
+		}
+		f.dirCache.Put(dir, directoryID)
+	}
+
+	items := make(map[string]*drive.File)
+	children := make(map[string][]*drive.File)
+	_, err = f.listWithMode(ctx, nil, "", false, false, false, false, true, func(item *drive.File) bool {
+		// A repeated ID across pages must not duplicate its subtree.
+		if _, found := items[item.Id]; found {
+			return false
+		}
+		items[item.Id] = item
+		for _, parentID := range item.Parents {
+			children[parentID] = append(children[parentID], item)
+		}
+		return false
+	})
+	if err != nil {
+		return err
+	}
+	entries, err := f.flatDirEntries(ctx, dir, directoryID, items, children)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 && f.isTeamDrive && f.root == "" && dir == "" {
+		if err := f.teamDriveOK(ctx); err != nil {
+			return err
+		}
+	}
+	list := list.NewHelper(callback)
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := list.Add(entry); err != nil {
+			return err
+		}
+	}
+	return list.Flush()
+}
+
+// flatDirEntries preserves file identity until the full parent graph is known.
+func (f *Fs) flatDirEntries(ctx context.Context, dir, rootID string, items map[string]*drive.File, children map[string][]*drive.File) (fs.DirEntries, error) {
+	var entries fs.DirEntries
+	ancestors := make(map[string]bool)
+	directories := map[string]bool{dir: true}
+	var visit func(string, string) error
+	visit = func(parentPath, parentID string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if ancestors[parentID] {
+			return fmt.Errorf("flat listing: directory cycle at %q (ID %q)", parentPath, parentID)
+		}
+		ancestors[parentID] = true
+		defer delete(ancestors, parentID)
+		for _, item := range children[parentID] {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			remote := path.Join(parentPath, item.Name)
+			if item.MimeType == shortcutMimeType {
+				if f.opt.SkipShortcuts {
+					continue
+				}
+				if item.ShortcutDetails == nil {
+					return fmt.Errorf("flat listing: shortcut %q has no target details", remote)
+				}
+				target, found := items[item.ShortcutDetails.TargetId]
+				if !found {
+					return fmt.Errorf("flat listing: shortcut %q target %q is outside the inventory; use normal listing or --drive-skip-shortcuts", remote, item.ShortcutDetails.TargetId)
+				}
+				if target.MimeType == shortcutMimeType {
+					return fmt.Errorf("flat listing: shortcut %q targets another shortcut", remote)
+				}
+				resolved := *target
+				resolved.Name, resolved.Parents, resolved.Trashed = item.Name, item.Parents, item.Trashed
+				resolved.Id = joinID(target.Id, item.Id)
+				item = &resolved
+			}
+			if item.MimeType == driveFolderType {
+				if ancestors[actualID(item.Id)] {
+					return fmt.Errorf("flat listing: directory cycle at %q (ID %q)", remote, actualID(item.Id))
+				}
+				if directories[remote] {
+					return fmt.Errorf("flat listing: duplicate directory path %q; use dedupe or normal listing", remote)
+				}
+				directories[remote] = true
+			}
+			entry, err := f.itemToDirEntry(ctx, remote, item)
+			if err != nil {
+				return err
+			}
+			if entry != nil {
+				entries = append(entries, entry)
+			}
+			if item.MimeType == driveFolderType {
+				if err := visit(remote, actualID(item.Id)); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := visit(dir, rootID); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
 // ListR lists the objects and directories of the Fs starting
 // from dir recursively into out.
 //
@@ -2242,6 +2393,9 @@ func (f *Fs) listRRunner(ctx context.Context, wg *sync.WaitGroup, in chan listRE
 // Don't implement this unless you have a more efficient way
 // of listing recursively that doing a directory traversal.
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
+	if f.opt.ListRFlat {
+		return f.listRFlat(ctx, dir, callback)
+	}
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return err

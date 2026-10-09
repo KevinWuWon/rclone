@@ -19,6 +19,7 @@ import (
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/cmd/ncdu/scan"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/operations"
@@ -26,8 +27,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var batch bool
+
 func init() {
 	cmd.Root.AddCommand(commandDefinition)
+	flags.BoolVarP(commandDefinition.Flags(), &batch, "batch", "", false, "Build the complete directory tree before displaying it", "")
 }
 
 var commandDefinition = &cobra.Command{
@@ -43,6 +47,11 @@ To make the user interface it first scans the entire remote given and
 builds an in memory representation.  rclone ncdu can be used during
 this scanning phase and you will see it building up the directory
 structure as it goes along.
+
+Use --batch to wait for the complete listing before displaying the tree.
+This uses recursive listing when supported by the remote, and calculates
+directory totals bottom-up without incremental updates. Filters and
+--max-depth still apply. If listing fails, no partial tree is displayed.
 
 You can interact with the user interface using key presses,
 press '?' to toggle the help on and off. The supported keys are:
@@ -924,6 +933,9 @@ func (u *UI) scan() (chan *scan.Dir, chan error, chan struct{}) {
 	u.listing = true
 	ctx := context.Background()
 	ctx, u.cancel = context.WithCancel(ctx)
+	if batch {
+		return scan.ScanBatch(ctx, u.f)
+	}
 	return scan.Scan(ctx, u.f)
 }
 
